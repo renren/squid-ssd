@@ -1,0 +1,11 @@
+#
+# Generic toplevel rules
+#
+*.s
+*.o
+*.a
+*.so
+
+#
+# Generic rules
+tags
