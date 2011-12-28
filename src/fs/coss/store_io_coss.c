@@ -87,7 +87,8 @@ CBDATA_TYPE(CossPendingReloc);
 static sfileno
 storeCossMemOnlyAllocate(SwapDir * SD, const StoreEntry * e)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     CossMemBuf *newmb;
     off_t retofs;
     size_t allocsize;
@@ -139,7 +140,8 @@ storeCossMemOnlyAllocate(SwapDir * SD, const StoreEntry * e)
 static sfileno
 storeCossAllocate(SwapDir * SD, const StoreEntry * e, int which)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     CossMemBuf *newmb;
     off_t retofs;
     size_t allocsize;
@@ -297,7 +299,8 @@ storeCossCreate(SwapDir * SD, StoreEntry * e, STFNCB * file_callback, STIOCB * c
 {
     CossState *cstate;
     storeIOState *sio;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
 
     assert(cs->rebuild.rebuilding == 0);
     coss_stats.create.ops++;
@@ -352,7 +355,8 @@ storeCossOpen(SwapDir * SD, StoreEntry * e, STFNCB * file_callback,
     CossState *cstate;
     sfileno f = e->swap_filen;
     sfileno nf;
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
 
     assert(cs->rebuild.rebuilding == 0);
 
@@ -480,7 +484,8 @@ void
 storeCossRead(SwapDir * SD, storeIOState * sio, char *buf, size_t size, squid_off_t offset, STRCB * callback, void *callback_data)
 {
     CossState *cstate = (CossState *) sio->fsstate;
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     CossReadOp *op;
 
     coss_stats.read.ops++;
@@ -509,6 +514,9 @@ storeCossWrite(SwapDir * SD, storeIOState * sio, char *buf, size_t size, squid_o
     CossMemBuf *membuf;
     off_t diskoffset;
 
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
+
     /*
      * If we get handed an object with a size of -1,
      * the squid code is broken
@@ -521,8 +529,8 @@ storeCossWrite(SwapDir * SD, storeIOState * sio, char *buf, size_t size, squid_o
     }
     debug(79, 3) ("storeCossWrite: %s: offset %ld, len %lu\n", stripePath(SD),
 	(long int) sio->offset, (unsigned long int) size);
-    diskoffset = storeCossFilenoToDiskOffset(sio->swap_filen, SD->fsdata) + sio->offset;
-    dest = storeCossMemPointerFromDiskOffset(SD->fsdata, diskoffset, &membuf);
+    diskoffset = storeCossFilenoToDiskOffset(sio->swap_filen, cs) + sio->offset;
+    dest = storeCossMemPointerFromDiskOffset(cs, diskoffset, &membuf);
     assert(dest != NULL);
     xmemcpy(dest, buf, size);
     sio->offset += size;
@@ -572,7 +580,8 @@ storeCossFilenoToMembuf(SwapDir * SD, sfileno s)
 {
     CossMemBuf *t = NULL;
     dlink_node *m;
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     off_t o = storeCossFilenoToDiskOffset(s, cs);
     for (m = cs->membufs.head; m; m = m->next) {
 	t = m->data;
@@ -631,7 +640,8 @@ static void
 storeCossMemBufUnlock(SwapDir * SD, storeIOState * sio)
 {
     CossState *cstate = (CossState *) sio->fsstate;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
     CossMemBuf *t = cstate->locked_membuf;
     if (NULL == t)
 	return;
@@ -670,7 +680,8 @@ storeCossMaybeWriteMemBuf(SwapDir * SD, CossMemBuf * t)
 void
 storeCossSync(SwapDir * SD)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     dlink_node *m;
     off_t end;
 
@@ -699,7 +710,8 @@ storeCossSync(SwapDir * SD)
 static void
 storeCossWriteMemBuf(SwapDir * SD, CossMemBuf * t)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     int cur_load_interval = (squid_curtime / cs->load_interval) % 2;
     int prev_load_interval = ((squid_curtime + cs->load_interval) / cs->load_interval) % 2;
     assert(t->flags.dead == 0);
@@ -814,7 +826,8 @@ storeCossWriteMemBufDone(int fd, int r_errflag, size_t r_len, void *my_data)
 #endif
 {
     CossMemBuf *t = my_data;
-    CossInfo *cs = (CossInfo *) t->SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) t->SD->fsdata;
+    CossInfo *cs = bcs->cs;
     int errflag;
     int len;
 #if USE_AUFSOPS
@@ -849,7 +862,8 @@ static CossMemBuf *
 storeCossCreateMemOnlyBuf(SwapDir * SD)
 {
     CossMemBuf *newmb;
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     off_t start;
     int stripe;
     static time_t last_warn = 0;
@@ -900,7 +914,8 @@ storeCossCreateMemBuf(SwapDir * SD, int stripe, sfileno curfn, int *collision)
     StoreEntry *e;
     dlink_node *m, *n;
     int numreleased = 0;
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     off_t start = (off_t) stripe * COSS_MEMBUF_SZ;
     off_t o;
     static time_t last_warn = 0;
@@ -969,7 +984,8 @@ storeCossCreateMemBuf(SwapDir * SD, int stripe, sfileno curfn, int *collision)
 void
 storeCossStartMembuf(SwapDir * sd)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     CossMemBuf *newmb;
     CBDATA_INIT_TYPE_FREECB(storeIOState, storeCossIOFreeEntry);
     CBDATA_INIT_TYPE_FREECB(CossMemBuf, NULL);
@@ -1247,7 +1263,7 @@ storeCossCompleteReadOp(CossInfo * cs, CossReadOp * op, int error)
 	sio->read.callback_data = NULL;
 	if (error == 0) {
 	    /* P is the beginning of the object data we're interested in */
-	    p = storeCossMemPointerFromDiskOffset(cs, storeCossFilenoToDiskOffset(sio->swap_filen, SD->fsdata), NULL);
+	    p = storeCossMemPointerFromDiskOffset(cs, storeCossFilenoToDiskOffset(sio->swap_filen, cs), NULL);
 	    assert(p != NULL);
 	    /* cstate->requestlen contains the current copy length */
 	    assert(cstate->requestlen == op->requestlen);

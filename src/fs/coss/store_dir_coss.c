@@ -127,7 +127,8 @@ struct _coss_stats coss_stats;
 char const *
 stripePath(SwapDir * sd)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     char pathtmp[SQUID_MAXPATHLEN];
     struct stat st;
 
@@ -184,7 +185,8 @@ storeCossDirSwapLogFile(SwapDir * sd, const char *ext)
 static void
 storeCossDirOpenSwapLog(SwapDir * sd)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     char *path;
     int fd;
     path = storeCossDirSwapLogFile(sd, NULL);
@@ -200,7 +202,8 @@ storeCossDirOpenSwapLog(SwapDir * sd)
 static void
 storeCossDirCloseSwapLog(SwapDir * sd)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     if (cs->swaplog_fd < 0)	/* not open */
 	return;
     file_close(cs->swaplog_fd);
@@ -212,7 +215,8 @@ storeCossDirCloseSwapLog(SwapDir * sd)
 static void
 storeCossDirInit(SwapDir * sd)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
 
     /* COSS is pretty useless without 64 bit file offsets */
     if (sizeof(off_t) < 8) {
@@ -245,7 +249,8 @@ storeCossDirInit(SwapDir * sd)
 void
 storeCossRemove(SwapDir * sd, StoreEntry * e)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int stripe;
 #if 0
     debug(1, 1) ("storeCossRemove: %x: %d/%d\n", e, (int) e->swap_dirn, (e) e->swap_filen);
@@ -267,7 +272,8 @@ storeCossRemove(SwapDir * sd, StoreEntry * e)
 void
 storeCossAdd(SwapDir * sd, StoreEntry * e, int curstripe)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     CossStripe *cstripe = &cs->stripes[curstripe];
     CossIndexNode *coss_node = memPoolAlloc(coss_index_pool);
     assert(!e->repl.data);
@@ -284,7 +290,8 @@ storeCossRebuildComplete(void *data)
 {
     RebuildState *rb = data;
     SwapDir *SD = rb->sd;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
     storeCossStartMembuf(SD);
     store_dirs_rebuilding--;
     storeCossDirCloseTmpSwapLog(SD);
@@ -318,7 +325,8 @@ storeCossDirRebuild(SwapDir * sd)
 static void
 storeCossDirCloseTmpSwapLog(SwapDir * sd)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     char *swaplog_path = xstrdup(storeCossDirSwapLogFile(sd, NULL));
     char *new_path = xstrdup(storeCossDirSwapLogFile(sd, ".new"));
     int fd;
@@ -340,7 +348,8 @@ storeCossDirCloseTmpSwapLog(SwapDir * sd)
 static FILE *
 storeCossDirOpenTmpSwapLog(SwapDir * sd, int *clean_flag, int *zero_flag)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     char *swaplog_path = xstrdup(storeCossDirSwapLogFile(sd, NULL));
     char *clean_path = xstrdup(storeCossDirSwapLogFile(sd, ".last-clean"));
     char *new_path = xstrdup(storeCossDirSwapLogFile(sd, ".new"));
@@ -549,7 +558,8 @@ storeSwapLogDataFree(void *s)
 static void
 storeCossDirSwapLog(const SwapDir * sd, const StoreEntry * e, int op)
 {
-    CossInfo *cs = (CossInfo *) sd->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->cs;
     storeSwapLogData *s = memAllocate(MEM_SWAP_LOG_DATA);
     s->op = (char) op;
     s->swap_filen = e->swap_filen;
@@ -576,7 +586,8 @@ storeCossCreateStripe(SwapDir * SD, const char *path)
     char *block;
     int swap;
     int i;
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
 
     debug(47, 1) ("Creating COSS stripe %s\n", path);
     swap = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
@@ -610,7 +621,8 @@ storeCossDirNewfs(SwapDir * SD)
 static void
 storeCossDirFree(SwapDir * SD)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     if (cs->swaplog_fd > -1) {
 	file_close(cs->swaplog_fd);
 	cs->swaplog_fd = -1;
@@ -618,6 +630,7 @@ storeCossDirFree(SwapDir * SD)
     xfree(cs->stripes);
     xfree(cs->memstripes);
     xfree(cs);
+    xfree(bcs);
     SD->fsdata = NULL;		/* Will aid debugging... */
 
 }
@@ -626,7 +639,8 @@ storeCossDirFree(SwapDir * SD)
 static void
 storeCossDirShutdown(SwapDir * SD)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     if (cs->fd == -1)
 	return;
     debug(47, 1) ("COSS: %s: syncing\n", stripePath(SD));
@@ -657,7 +671,8 @@ storeCossDirShutdown(SwapDir * SD)
 int
 storeCossDirCheckObj(SwapDir * SD, const StoreEntry * e)
 {
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
     int objsize = objectLen(e) + e->mem_obj->swap_hdr_sz;
     /* Check if the object is a special object, we can't cache these */
     if (EBIT_TEST(e->flags, ENTRY_SPECIAL))
@@ -674,7 +689,8 @@ storeCossDirCheckObj(SwapDir * SD, const StoreEntry * e)
 int
 storeCossDirCheckLoadAv(SwapDir * SD, store_op_t op)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
 #if USE_AUFSOPS
     float disk_size_weight, current_write_weight;
     int cur_load_interval = (squid_curtime / cs->load_interval) % 2;
@@ -728,7 +744,8 @@ storeCossDirCheckLoadAv(SwapDir * SD, store_op_t op)
 static int
 storeCossDirCallback(SwapDir * SD)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     storeCossFreeDeadMemBufs(cs);
 #if USE_AUFSOPS
     /* I believe this call, at the present, checks all callbacks for all SDs, not just ours */
@@ -743,7 +760,8 @@ storeCossDirCallback(SwapDir * SD)
 static void
 storeCossDirStats(SwapDir * SD, StoreEntry * sentry)
 {
-    CossInfo *cs = (CossInfo *) SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
 
     storeAppendPrintf(sentry, "\n");
     storeAppendPrintf(sentry, "Maximum Size: %d KB\n", SD->max_size);
@@ -776,6 +794,7 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 {
     unsigned int i;
     unsigned int size;
+    BigCossInfo *bcs;
     CossInfo *cs;
     off_t max_offset;
 
@@ -784,6 +803,10 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
     if (size <= 0)
 	fatal("storeCossDirParse: invalid size value");
 
+    bcs = xcalloc(1, sizeof(BigCossInfo));
+    if (bcs == NULL)
+	fatal("storeCossDirParse: couldn't xmalloc() BigCossInfo!\n");
+
     cs = xcalloc(1, sizeof(CossInfo));
     if (cs == NULL)
 	fatal("storeCossDirParse: couldn't xmalloc() CossInfo!\n");
@@ -791,7 +814,10 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
     sd->index = index;
     sd->path = xstrdup(path);
     sd->max_size = size;
-    sd->fsdata = cs;
+    sd->fsdata = bcs;
+
+    bcs->cs = cs;
+    bcs->numbscs = 0;
 
     cs->fd = -1;
     cs->swaplog_fd = -1;
@@ -941,7 +967,8 @@ storeCossDirDump(StoreEntry * entry, SwapDir * s)
 static void
 storeCossDirParseMaxFullBufs(SwapDir * sd, const char *name, const char *value, int reconfiguring)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int maxfull = atoi(value);
     if (maxfull <= HITONLY_BUFS)
 	fatalf("COSS ERROR: There must be more than %d maxfullbufs\n", HITONLY_BUFS);
@@ -953,7 +980,8 @@ storeCossDirParseMaxFullBufs(SwapDir * sd, const char *name, const char *value, 
 static void
 storeCossDirParseMemOnlyBufs(SwapDir * sd, const char *name, const char *value, int reconfiguring)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int membufs = atoi(value);
     if (reconfiguring) {
 	debug(47, 0) ("WARNING: cannot change COSS memory bufs Squid is running\n");
@@ -969,7 +997,8 @@ storeCossDirParseMemOnlyBufs(SwapDir * sd, const char *name, const char *value, 
 static void
 storeCossDirParseMaxWaste(SwapDir * sd, const char *name, const char *value, int reconfiguring)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int waste = atoi(value);
 
     if (waste < 8192)
@@ -982,7 +1011,8 @@ storeCossDirParseMaxWaste(SwapDir * sd, const char *name, const char *value, int
 static void
 storeCossDirParseOverwritePct(SwapDir * sd, const char *name, const char *value, int reconfiguring)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int pct = atoi(value);
 
     if (pct < 0)
@@ -996,7 +1026,8 @@ storeCossDirParseOverwritePct(SwapDir * sd, const char *name, const char *value,
 static void
 storeCossDirParseBlkSize(SwapDir * sd, const char *name, const char *value, int reconfiguring)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int blksz = atoi(value);
     int check;
     int nbits;
@@ -1025,35 +1056,40 @@ storeCossDirParseBlkSize(SwapDir * sd, const char *name, const char *value, int 
 static void
 storeCossDirDumpMaxFullBufs(StoreEntry * e, const char *option, SwapDir * sd)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     storeAppendPrintf(e, " maxfullbufs=%d MB", cs->maxfullstripes);
 }
 
 static void
 storeCossDirDumpMemOnlyBufs(StoreEntry * e, const char *option, SwapDir * sd)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     storeAppendPrintf(e, " membufs=%d MB", cs->nummemstripes);
 }
 
 static void
 storeCossDirDumpMaxWaste(StoreEntry * e, const char *option, SwapDir * sd)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     storeAppendPrintf(e, " max-stripe-waste=%d", cs->sizerange_min);
 }
 
 static void
 storeCossDirDumpOverwritePct(StoreEntry * e, const char *option, SwapDir * sd)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     storeAppendPrintf(e, " overwrite-percent=%d%%", (int) cs->minumum_overwrite_pct * 100);
 }
 
 static void
 storeCossDirDumpBlkSize(StoreEntry * e, const char *option, SwapDir * sd)
 {
-    CossInfo *cs = sd->fsdata;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     storeAppendPrintf(e, " block-size=%d", 1 << cs->blksz_bits);
 }
 
@@ -1068,7 +1104,8 @@ storeCossDirPick(void)
     for (i = 0; i < Config.cacheSwap.n_configured; i++) {
 	SD = &Config.cacheSwap.swapDirs[i];
 	if (strcmp(SD->type, SWAPDIR_COSS) == 0) {
-	    CossInfo *cs = (CossInfo *) SD->fsdata;
+	    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+	    CossInfo *cs = bcs->cs;
 	    if (cs->fd != -1) {
 		if ((last_coss_pick_index == -1) || (n_coss_dirs == 1)) {
 		    last_coss_pick_index = i;
@@ -1166,7 +1203,8 @@ storeDirCoss_ReadStripeComplete(int fd, const char *buf, int r_len, int r_errfla
 {
     RebuildState *rb = my_data;
     SwapDir *SD = rb->sd;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
 #if USE_AUFSOPS
     int r_errflag;
     int r_len;
@@ -1211,7 +1249,8 @@ static void
 storeDirCoss_ReadStripe(RebuildState * rb)
 {
     SwapDir *SD = rb->sd;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
 
     assert(cs->rebuild.reading == 0);
     cs->rebuild.reading = 1;
@@ -1234,7 +1273,8 @@ static void
 storeDirCoss_StartDiskRebuild(RebuildState * rb)
 {
     SwapDir *SD = rb->sd;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
     assert(cs->rebuild.rebuilding == 0);
     assert(cs->numstripes > 0);
     assert(cs->rebuild.buf == NULL);
@@ -1255,7 +1295,8 @@ static void
 storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 {
     SwapDir *SD = rb->sd;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = SD->fsdata;
+    CossInfo *cs = bcs->cs;
     tlv *t, *tlv_list;
     int j = 0;
     int bl = 0;
@@ -1410,7 +1451,8 @@ storeCoss_AddStoreEntry(RebuildState * rb, const cache_key * key, StoreEntry * e
 {
     StoreEntry *ne;
     SwapDir *SD = rb->sd;
-    CossInfo *cs = SD->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs = bcs->cs;
     rb->counts.objcount++;
     /* The Passed-in store entry is temporary; don't bloody use it directly! */
     assert(e->swap_dirn == SD->index);

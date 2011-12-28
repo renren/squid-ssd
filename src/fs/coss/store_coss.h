@@ -11,6 +11,7 @@
 
 typedef struct _cossmembuf CossMemBuf;
 typedef struct _cossinfo CossInfo;
+typedef struct _bigcossinfo BigCossInfo;
 typedef struct _cossstate CossState;
 typedef struct _cossindex CossIndexNode;
 typedef struct _coss_pending_reloc CossPendingReloc;
@@ -169,6 +170,12 @@ struct _cossinfo {
     struct _cossstripe *memstripes;
     int curmemstripe;
     const char *stripe_path;
+};
+
+struct _bigcossinfo {
+    CossInfo *cs;
+    CossInfo *bscs[8];
+    int numbscs;
 };
 
 struct _cossindex {
