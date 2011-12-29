@@ -96,11 +96,13 @@ static STFSRECONFIGURE storeCossDirReconfigure;
 static STDUMP storeCossDirDump;
 static STCALLBACK storeCossDirCallback;
 static void storeCossDirParseBlkSize(SwapDir *, const char *, const char *, int);
+static void storeCossDirParseBackstore(SwapDir *, const char *, const char *, int);
 static void storeCossDirParseOverwritePct(SwapDir *, const char *, const char *, int);
 static void storeCossDirParseMaxWaste(SwapDir *, const char *, const char *, int);
 static void storeCossDirParseMemOnlyBufs(SwapDir *, const char *, const char *, int);
 static void storeCossDirParseMaxFullBufs(SwapDir *, const char *, const char *, int);
 static void storeCossDirDumpBlkSize(StoreEntry *, const char *, SwapDir *);
+static void storeCossDirDumpBackstore(StoreEntry *, const char *, SwapDir *);
 static void storeCossDirDumpOverwritePct(StoreEntry *, const char *, SwapDir *);
 static void storeCossDirDumpMaxWaste(StoreEntry *, const char *, SwapDir *);
 static void storeCossDirDumpMemOnlyBufs(StoreEntry *, const char *, SwapDir *);
@@ -115,6 +117,7 @@ STSETUP storeFsSetup_coss;
 static struct cache_dir_option options[] =
 {
     {"block-size", storeCossDirParseBlkSize, storeCossDirDumpBlkSize},
+    {"backstore", storeCossDirParseBackstore, storeCossDirDumpBackstore},
     {"overwrite-percent", storeCossDirParseOverwritePct, storeCossDirDumpOverwritePct},
     {"max-stripe-waste", storeCossDirParseMaxWaste, storeCossDirDumpMaxWaste},
     {"membufs", storeCossDirParseMemOnlyBufs, storeCossDirDumpMemOnlyBufs},
@@ -125,22 +128,8 @@ static struct cache_dir_option options[] =
 struct _coss_stats coss_stats;
 
 char const *
-stripePath(SwapDir * sd)
+stripeCossPath(CossInfo * cs)
 {
-    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
-    CossInfo *cs = bcs->cs;
-    char pathtmp[SQUID_MAXPATHLEN];
-    struct stat st;
-
-    if (!cs->stripe_path) {
-	strcpy(pathtmp, sd->path);
-	if (stat(sd->path, &st) == 0) {
-	    if (S_ISDIR(st.st_mode))
-		strcat(pathtmp, "/stripe");
-	} else
-	    fatalf("stripePath: Cannot stat %s.", sd->path);
-	cs->stripe_path = xstrdup(pathtmp);
-    }
     return cs->stripe_path;
 }
 
@@ -228,9 +217,9 @@ storeCossDirInit(SwapDir * sd)
 #else
     a_file_setupqueue(&cs->aq);
 #endif
-    cs->fd = file_open(stripePath(sd), O_RDWR | O_CREAT | O_BINARY);
+    cs->fd = file_open(stripeCossPath(cs), O_RDWR | O_CREAT | O_BINARY);
     if (cs->fd < 0) {
-	debug(79, 1) ("%s: %s\n", stripePath(sd), xstrerror());
+	debug(79, 1) ("%s: %s\n", stripeCossPath(cs), xstrerror());
 	fatal("storeCossDirInit: Failed to open a COSS file.");
     }
     storeCossDirOpenSwapLog(sd);
@@ -296,7 +285,7 @@ storeCossRebuildComplete(void *data)
     store_dirs_rebuilding--;
     storeCossDirCloseTmpSwapLog(SD);
     storeRebuildComplete(&rb->counts);
-    debug(47, 1) ("COSS: %s: Rebuild Completed\n", stripePath(SD));
+    debug(47, 1) ("COSS: %s: Rebuild Completed\n", stripeCossPath(cs));
     cs->rebuild.rebuilding = 0;
     debug(47, 1) ("  %d objects scanned, %d objects relocated, %d objects fresher, %d objects ignored\n",
 	rb->counts.scancount, rb->cosscounts.reloc, rb->cosscounts.fresher, rb->cosscounts.unknown);
@@ -308,6 +297,8 @@ static void
 storeCossDirRebuild(SwapDir * sd)
 {
     RebuildState *rb;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *cs = bcs->cs;
     int clean = 0;
     int zero = 0;
     FILE *fp;
@@ -317,7 +308,7 @@ storeCossDirRebuild(SwapDir * sd)
     rb->flags.clean = (unsigned int) clean;
     fp = storeCossDirOpenTmpSwapLog(sd, &clean, &zero);
     fclose(fp);
-    debug(20, 1) ("Rebuilding COSS storage in %s (DIRTY)\n", stripePath(sd));
+    debug(20, 1) ("Rebuilding COSS storage in %s (DIRTY)\n", stripeCossPath(cs));
     store_dirs_rebuilding++;
     storeDirCoss_StartDiskRebuild(rb);
 }
@@ -581,14 +572,14 @@ storeCossDirSwapLog(const SwapDir * sd, const StoreEntry * e, int op)
 }
 
 static void
-storeCossCreateStripe(SwapDir * SD, const char *path)
+storeCossCreateStripe(CossInfo * cs)
 {
     char *block;
+    char const *path;
     int swap;
     int i;
-    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
-    CossInfo *cs = bcs->cs;
 
+    path = stripeCossPath(cs);
     debug(47, 1) ("Creating COSS stripe %s\n", path);
     swap = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
     block = (char *) xcalloc(COSS_MEMBUF_SZ, 1);
@@ -604,15 +595,20 @@ storeCossCreateStripe(SwapDir * SD, const char *path)
 static void
 storeCossDirNewfs(SwapDir * SD)
 {
+    int i;
     struct stat st;
+    BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
+    CossInfo *cs;
 
-    if (stat(SD->path, &st) == 0) {
-	if (S_ISDIR(st.st_mode)) {
-	    if (stat(stripePath(SD), &st) != 0)
-		storeCossCreateStripe(SD, stripePath(SD));
-	}
-    } else
-	storeCossCreateStripe(SD, (const char *) SD->path);
+    cs = bcs->cs;
+    if (stat(stripeCossPath(cs), &st) != 0)
+	storeCossCreateStripe(cs);
+
+    for (i = 0; i < bcs->numbscs; i++) {
+	cs = bcs->bscs[i];
+	if (stat(stripeCossPath(cs), &st) != 0)
+	    storeCossCreateStripe(cs);
+    }
 }
 
 /*
@@ -643,7 +639,7 @@ storeCossDirShutdown(SwapDir * SD)
     CossInfo *cs = bcs->cs;
     if (cs->fd == -1)
 	return;
-    debug(47, 1) ("COSS: %s: syncing\n", stripePath(SD));
+    debug(47, 1) ("COSS: %s: syncing\n", stripeCossPath(cs));
 
     storeCossSync(SD);		/* This'll call a_file_syncqueue() or a aioSync() */
 #if !USE_AUFSOPS
@@ -797,6 +793,8 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
     BigCossInfo *bcs;
     CossInfo *cs;
     off_t max_offset;
+    char pathtmp[SQUID_MAXPATHLEN];
+    struct stat st;
 
     i = GetInteger();
     size = i << 10;		/* Mbytes to Kbytes */
@@ -816,6 +814,13 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
     sd->max_size = size;
     sd->fsdata = bcs;
 
+    strcpy(pathtmp, path);
+    if (stat(path, &st) == 0)
+	if (S_ISDIR(st.st_mode))
+	    strcat(pathtmp, "/stripe");
+
+    cs->stripe_path = xstrdup(pathtmp);
+    cs->max_size = size;
     bcs->cs = cs;
     bcs->numbscs = 0;
 
@@ -887,13 +892,13 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
      * signed integer, as defined in structs.h.
      */
     max_offset = (off_t) 0xFFFFFF << cs->blksz_bits;
-    if ((sd->max_size + (cs->nummemstripes * (COSS_MEMBUF_SZ >> 10))) > (unsigned long) (max_offset >> 10)) {
+    if ((cs->max_size + (cs->nummemstripes * (COSS_MEMBUF_SZ >> 10))) > (unsigned long) (max_offset >> 10)) {
 	debug(47, 1) ("COSS block-size = %d bytes\n", 1 << cs->blksz_bits);
 	debug(47, 1) ("COSS largest file offset = %lu KB\n", (unsigned long) max_offset >> 10);
-	debug(47, 1) ("COSS cache_dir size = %d KB\n", sd->max_size);
+	debug(47, 1) ("COSS cache_dir size = %d KB\n", cs->max_size);
 	fatal("COSS cache_dir size exceeds largest offset\n");
     }
-    cs->max_disk_nf = ((off_t) sd->max_size << 10) >> cs->blksz_bits;
+    cs->max_disk_nf = ((off_t) cs->max_size << 10) >> cs->blksz_bits;
     debug(47, 2) ("COSS: max disk fileno is %d\n", cs->max_disk_nf);
 
     /* XXX todo checks */
@@ -902,7 +907,7 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 
     /* Ensure that the max size IS a multiple of the membuf size, or things
      * will get very fruity near the end of the disk. */
-    cs->numstripes = (off_t) (((off_t) sd->max_size) << 10) / COSS_MEMBUF_SZ;
+    cs->numstripes = (off_t) (((off_t) cs->max_size) << 10) / COSS_MEMBUF_SZ;
     debug(47, 2) ("COSS: number of stripes: %d of %d bytes each\n", cs->numstripes, COSS_MEMBUF_SZ);
     cs->stripes = xcalloc(cs->numstripes, sizeof(struct _cossstripe));
     for (i = 0; i < cs->numstripes; i++) {
@@ -929,9 +934,12 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 	cs->memstripes[i].numdiskobjs = -1;
     }
 
+    for (i = 0; i < bcs->numbscs; i++)
+	bcs->bscs[i]->numstripes = (off_t) (((off_t) bcs->bscs[i]->max_size) << 10) / COSS_MEMBUF_SZ;
+
     /* Update the max size (used for load calculations) */
-    if (sd->max_size > max_coss_dir_size)
-	max_coss_dir_size = sd->max_size;
+    if (cs->max_size > max_coss_dir_size)
+	max_coss_dir_size = cs->max_size;
 }
 
 static void
@@ -1054,6 +1062,45 @@ storeCossDirParseBlkSize(SwapDir * sd, const char *name, const char *value, int 
 }
 
 static void
+storeCossDirParseBackstore(SwapDir * sd, const char *name, const char *value, int reconfiguring)
+{
+    int   i;
+    char *cursor;
+    struct stat st;
+    char pathtmp[SQUID_MAXPATHLEN];
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *bs;
+
+    if (reconfiguring) {
+	debug(47, 0) ("WARNING: cannot change COSS backstore while Squid is running\n");
+	return;
+    }
+
+    bs = xcalloc(1, sizeof(CossInfo));
+    if (bs == NULL)
+	fatal("storeCossDirParseBackStore: couldn't xmalloc() CossInfo!\n");
+    bcs->bscs[bcs->numbscs++] = bs;
+
+    strcpy(pathtmp, value);
+    cursor = strchr(pathtmp, ',');
+    if (cursor == NULL)
+	fatal("COSS Error: example config: backstore=/hdd0/coss/stripe,102400\n");
+
+    *cursor++ = 0;
+    i = atoi(cursor);
+    if (i <= 0)
+	fatal("COSS Error: invalid backstore size value");
+    bs->max_size = i << 10;
+
+    if (stat(pathtmp, &st) == 0)
+	if (S_ISDIR(st.st_mode))
+	    strcat(pathtmp, "/stripe");
+    bs->stripe_path = xstrdup(pathtmp);
+
+    sd->max_size += bs->max_size;
+}
+
+static void
 storeCossDirDumpMaxFullBufs(StoreEntry * e, const char *option, SwapDir * sd)
 {
     BigCossInfo *bcs = sd->fsdata;
@@ -1091,6 +1138,19 @@ storeCossDirDumpBlkSize(StoreEntry * e, const char *option, SwapDir * sd)
     BigCossInfo *bcs = sd->fsdata;
     CossInfo *cs = bcs->cs;
     storeAppendPrintf(e, " block-size=%d", 1 << cs->blksz_bits);
+}
+
+static void
+storeCossDirDumpBackstore(StoreEntry * e, const char *option, SwapDir * sd)
+{
+    int i;
+    BigCossInfo *bcs = sd->fsdata;
+    CossInfo *bs;
+
+    for (i = 0; i < bcs->numbscs; i++) {
+	bs = bcs->bscs[i];
+	storeAppendPrintf(e, " backstore=%s,%d", bs->stripe_path, bs->max_size >> 10);
+    }
 }
 
 static SwapDir *
@@ -1216,10 +1276,10 @@ storeDirCoss_ReadStripeComplete(int fd, const char *buf, int r_len, int r_errfla
     xmemcpy(cs->rebuild.buf, buf, r_len);
 #endif
 
-    debug(47, 2) ("COSS: %s: stripe %d, read %d bytes, status %d\n", stripePath(SD), cs->rebuild.curstripe, r_len, r_errflag);
+    debug(47, 2) ("COSS: %s: stripe %d, read %d bytes, status %d\n", stripeCossPath(cs), cs->rebuild.curstripe, r_len, r_errflag);
     cs->rebuild.reading = 0;
     if (r_errflag != DISK_OK) {
-	debug(47, 2) ("COSS: %s: stripe %d: error! Ignoring objects in this stripe.\n", stripePath(SD), cs->rebuild.curstripe);
+	debug(47, 2) ("COSS: %s: stripe %d: error! Ignoring objects in this stripe.\n", stripeCossPath(cs), cs->rebuild.curstripe);
 	goto nextstripe;
     }
     cs->rebuild.buflen = r_len;
@@ -1236,7 +1296,7 @@ storeDirCoss_ReadStripeComplete(int fd, const char *buf, int r_len, int r_errfla
     cs->rebuild.curstripe++;
     if (cs->rebuild.curstripe >= cs->numstripes) {
 	/* Completed the rebuild - move onto the next phase */
-	debug(47, 2) ("COSS: %s: completed reading the stripes.\n", stripePath(SD));
+	debug(47, 2) ("COSS: %s: completed reading the stripes.\n", stripeCossPath(cs));
 	storeCossRebuildComplete(rb);
 	return;
     } else {
@@ -1255,9 +1315,9 @@ storeDirCoss_ReadStripe(RebuildState * rb)
     assert(cs->rebuild.reading == 0);
     cs->rebuild.reading = 1;
     /* Use POSIX AIO for now */
-    debug(47, 2) ("COSS: %s: reading stripe %d\n", stripePath(SD), cs->rebuild.curstripe);
+    debug(47, 2) ("COSS: %s: reading stripe %d\n", stripeCossPath(cs), cs->rebuild.curstripe);
     if (cs->rebuild.curstripe > rb->report_current) {
-	debug(47, 1) ("COSS: %s: Rebuilding (%d %% completed - %d/%d stripes)\n", stripePath(SD),
+	debug(47, 1) ("COSS: %s: Rebuilding (%d %% completed - %d/%d stripes)\n", stripeCossPath(cs),
 	    cs->rebuild.curstripe * 100 / cs->numstripes, cs->rebuild.curstripe, cs->numstripes);
 	rb->report_current += rb->report_interval;
     }
@@ -1284,7 +1344,7 @@ storeDirCoss_StartDiskRebuild(RebuildState * rb)
     cs->rebuild.buf = xmalloc(COSS_MEMBUF_SZ);
     rb->report_interval = cs->numstripes / COSS_REPORT_INTERVAL;
     rb->report_current = 0;
-    debug(47, 2) ("COSS: %s: Beginning disk rebuild.\n", stripePath(SD));
+    debug(47, 2) ("COSS: %s: Beginning disk rebuild.\n", stripeCossPath(cs));
     storeDirCoss_ReadStripe(rb);
 }
 
@@ -1312,7 +1372,7 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
     assert(cs->rebuild.buf != NULL);
 
     if (cs->rebuild.buflen == 0) {
-	debug(47, 3) ("COSS: %s: stripe %d: read 0 bytes, skipping stripe\n", stripePath(SD), cs->rebuild.curstripe);
+	debug(47, 3) ("COSS: %s: stripe %d: read 0 bytes, skipping stripe\n", stripeCossPath(cs), cs->rebuild.curstripe);
 	return;
     }
     while (j < cs->rebuild.buflen) {
@@ -1321,11 +1381,11 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 	/* XXX there's no bounds checking on the buffer being passed into storeSwapMetaUnpack! */
 	tlv_list = storeSwapMetaUnpack(cs->rebuild.buf + j, &bl);
 	if (tlv_list == NULL) {
-	    debug(47, 3) ("COSS: %s: stripe %d: offset %d gives NULL swapmeta data; end of stripe\n", stripePath(SD), cs->rebuild.curstripe, j);
+	    debug(47, 3) ("COSS: %s: stripe %d: offset %d gives NULL swapmeta data; end of stripe\n", stripeCossPath(cs), cs->rebuild.curstripe, j);
 	    return;
 	}
 	filen = (off_t) j / (off_t) blocksize + (off_t) ((off_t) cs->rebuild.curstripe * (off_t) COSS_MEMBUF_SZ / (off_t) blocksize);
-	debug(47, 3) ("COSS: %s: stripe %d: filen %d: header size %d\n", stripePath(SD), cs->rebuild.curstripe, filen, bl);
+	debug(47, 3) ("COSS: %s: stripe %d: filen %d: header size %d\n", stripeCossPath(cs), cs->rebuild.curstripe, filen, bl);
 
 	/* COSS objects will have an object size written into the metadata */
 	memset(&tmpe, 0, sizeof(tmpe));
@@ -1341,7 +1401,7 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 		break;
 	    case STORE_META_KEY:
 		if (t->length != SQUID_MD5_DIGEST_LENGTH) {
-		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_KEY length. Ignoring object.\n", stripePath(SD), cs->rebuild.curstripe, j);
+		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_KEY length. Ignoring object.\n", stripeCossPath(cs), cs->rebuild.curstripe, j);
 		    goto nextobject;
 		}
 		xmemcpy(key, t->value, SQUID_MD5_DIGEST_LENGTH);
@@ -1349,7 +1409,7 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 #if SIZEOF_SQUID_FILE_SZ == SIZEOF_SIZE_T
 	    case STORE_META_STD:
 		if (t->length != STORE_HDR_METASIZE) {
-		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_STD length. Ignoring object.\n", stripePath(SD), cs->rebuild.curstripe, j);
+		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_STD length. Ignoring object.\n", stripeCossPath(cs), cs->rebuild.curstripe, j);
 		    goto nextobject;
 		}
 		xmemcpy(&tmpe.timestamp, t->value, STORE_HDR_METASIZE);
@@ -1357,14 +1417,14 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 #else
 	    case STORE_META_STD_LFS:
 		if (t->length != STORE_HDR_METASIZE) {
-		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_STD_LFS length. Ignoring object.\n", stripePath(SD), cs->rebuild.curstripe, j);
+		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_STD_LFS length. Ignoring object.\n", stripeCossPath(cs), cs->rebuild.curstripe, j);
 		    goto nextobject;
 		}
 		xmemcpy(&tmpe.timestamp, t->value, STORE_HDR_METASIZE);
 		break;
 	    case STORE_META_STD:
 		if (t->length != STORE_HDR_METASIZE_OLD) {
-		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_STD length. Ignoring object.\n", stripePath(SD), cs->rebuild.curstripe, j);
+		    debug(47, 1) ("COSS: %s: stripe %d: offset %d has invalid STORE_META_STD length. Ignoring object.\n", stripeCossPath(cs), cs->rebuild.curstripe, j);
 		    goto nextobject;
 		} {
 		    struct {
@@ -1391,7 +1451,7 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 	}
 	/* Make sure we have an object; if we don't then it may be an indication of trouble */
 	if (l == NULL) {
-	    debug(47, 3) ("COSS: %s: stripe %d: Object with no size; end of stripe\n", stripePath(SD), cs->rebuild.curstripe);
+	    debug(47, 3) ("COSS: %s: stripe %d: Object with no size; end of stripe\n", stripeCossPath(cs), cs->rebuild.curstripe);
 	    storeSwapTLVFree(tlv_list);
 	    return;
 	}
@@ -1400,13 +1460,13 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 	 * we've just been informed about
 	 */
 	if ((cs->rebuild.buflen - j) < (len + bl)) {
-	    debug(47, 3) ("COSS: %s: stripe %d: Not enough data in this stripe for this object, bye bye.\n", stripePath(SD), cs->rebuild.curstripe);
+	    debug(47, 3) ("COSS: %s: stripe %d: Not enough data in this stripe for this object, bye bye.\n", stripeCossPath(cs), cs->rebuild.curstripe);
 	    storeSwapTLVFree(tlv_list);
 	    return;
 	}
 	/* Houston, we have an object */
 	if (storeKeyNull(key)) {
-	    debug(47, 3) ("COSS: %s: stripe %d: null data, next!\n", stripePath(SD), cs->rebuild.curstripe);
+	    debug(47, 3) ("COSS: %s: stripe %d: null data, next!\n", stripeCossPath(cs), cs->rebuild.curstripe);
 	    goto nextobject;
 	}
 	rb->counts.scancount++;
@@ -1416,11 +1476,11 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 	    tmpe.swap_file_sz = len + bl;
 	}
 	if (tmpe.swap_file_sz != (len + bl)) {
-	    debug(47, 3) ("COSS: %s: stripe %d: file size mismatch (%" PRINTF_OFF_T " != %" PRINTF_OFF_T ")\n", stripePath(SD), cs->rebuild.curstripe, tmpe.swap_file_sz, len);
+	    debug(47, 3) ("COSS: %s: stripe %d: file size mismatch (%" PRINTF_OFF_T " != %" PRINTF_OFF_T ")\n", stripeCossPath(cs), cs->rebuild.curstripe, tmpe.swap_file_sz, len);
 	    goto nextobject;
 	}
 	if (EBIT_TEST(tmpe.flags, KEY_PRIVATE)) {
-	    debug(47, 3) ("COSS: %s: stripe %d: private key flag set, ignoring.\n", stripePath(SD), cs->rebuild.curstripe);
+	    debug(47, 3) ("COSS: %s: stripe %d: private key flag set, ignoring.\n", stripeCossPath(cs), cs->rebuild.curstripe);
 	    rb->counts.badflags++;
 	    goto nextobject;
 	}
@@ -1428,7 +1488,7 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
 	tmpe.swap_filen = filen;
 	tmpe.swap_dirn = SD->index;
 
-	debug(47, 3) ("COSS: %s Considering filneumber %d\n", stripePath(SD), tmpe.swap_filen);
+	debug(47, 3) ("COSS: %s Considering filneumber %d\n", stripeCossPath(cs), tmpe.swap_filen);
 	storeCoss_ConsiderStoreEntry(rb, key, &tmpe);
 
       nextobject:
