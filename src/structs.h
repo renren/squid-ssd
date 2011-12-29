@@ -1787,8 +1787,9 @@ struct _StoreEntry {
     u_short refcount;
     u_short flags;
     /* END OF ON-DISK STORE_META_STD */
-    sfileno swap_filen:25;
-    sdirno swap_dirn:7;
+    sfileno swap_filen;
+    sdirno swap_dirn:8;
+    signed int fsdata:24;
     u_short lock_count;		/* Assume < 65536! */
     mem_status_t mem_status:3;
     ping_status_t ping_status:3;

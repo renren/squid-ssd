@@ -124,7 +124,7 @@ storeCossMemOnlyAllocate(SwapDir * SD, const StoreEntry * e)
     cs->current_memonly_membuf->numobjs++;
     cs->current_memonly_offset = ((cs->current_memonly_offset + cs->blksz_mask) >> cs->blksz_bits) << cs->blksz_bits;
     f = storeCossDiskOffsetToFileno(retofs, cs);
-    assert(f >= 0 && f <= 0xffffff);
+    assert(f >= 0 && f <= 0x7FFFFFFF);
     debug(79, 3) ("storeCossMemOnlyAllocate: offset %" PRId64 ", filen: %d\n", (int64_t) retofs, f);
     return f;
 
@@ -230,7 +230,7 @@ storeCossAllocate(SwapDir * SD, const StoreEntry * e, int which)
 	/* round up to our blocksize */
 	cs->current_offset = ((cs->current_offset + cs->blksz_mask) >> cs->blksz_bits) << cs->blksz_bits;
 	f = storeCossDiskOffsetToFileno(retofs, cs);
-	assert(f >= 0 && f <= 0xffffff);
+	assert(f >= 0 && f <= 0x7FFFFFFF);
 	debug(79, 3) ("storeCossAllocate: offset %" PRId64 ", filen: %d\n", (int64_t) retofs, f);
 
 	/* 
