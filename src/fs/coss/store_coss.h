@@ -171,12 +171,17 @@ struct _cossinfo {
     int curmemstripe;
     const char *stripe_path;
     int max_size;
+    SwapDir *sd;
 };
+
+#define BIGCOSS_CS        -1
+#define BIGCOSS_BSCS_NUM   8
 
 struct _bigcossinfo {
     CossInfo *cs;
-    CossInfo *bscs[8];
+    CossInfo *bscs[BIGCOSS_BSCS_NUM];
     int numbscs;
+    int rebuilding;
 };
 
 struct _cossindex {

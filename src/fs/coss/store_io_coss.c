@@ -255,8 +255,9 @@ storeCossAllocate(SwapDir * SD, const StoreEntry * e, int which)
 void
 storeCossUnlink(SwapDir * SD, StoreEntry * e)
 {
+    signed int swap_cossn = e->fsdata;
     BigCossInfo *bcs = SD->fsdata;
-    CossInfo *cs = bcs->cs;
+    CossInfo *cs = bcs->bscs[swap_cossn];
 
     debug(79, 3) ("storeCossUnlink: %s: offset %d\n", stripeCossPath(cs), e->swap_filen);
     coss_stats.unlink.ops++;
@@ -267,8 +268,9 @@ storeCossUnlink(SwapDir * SD, StoreEntry * e)
 void
 storeCossRecycle(SwapDir * SD, StoreEntry * e)
 {
+    signed int swap_cossn = e->fsdata;
     BigCossInfo *bcs = SD->fsdata;
-    CossInfo *cs = bcs->cs;
+    CossInfo *cs = bcs->bscs[swap_cossn];
 
     debug(79, 3) ("storeCossRecycle: %s: offset %d\n", stripeCossPath(cs), e->swap_filen);
 
