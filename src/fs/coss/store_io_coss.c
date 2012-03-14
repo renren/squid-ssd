@@ -45,8 +45,10 @@
 
 #if USE_AUFSOPS
 static AIOCB storeCossWriteMemBufDone;
+static AIOCB storeCossMigrateStripeDone;
 #else
 static DWCB storeCossWriteMemBufDone;
+static DWCB storeCossMigrateStripeDone;
 #endif
 static void storeCossIOCallback(storeIOState * sio, int errflag);
 static char *storeCossMemPointerFromDiskOffset(CossInfo * cs, off_t offset, CossMemBuf ** mb);
@@ -65,12 +67,14 @@ int storeCossFilenoToStripe(CossInfo * cs, sfileno filen);
 static void membuf_describe(CossMemBuf * t, int level, int line);
 
 /* Handle relocates - temporary routines until readops have been fleshed out */
-void storeCossNewPendingRelocate(CossInfo * cs, storeIOState * sio, sfileno original_filen, sfileno new_filen);
+void storeCossNewPendingRelocate(CossInfo * to, CossInfo * from, storeIOState * sio, sfileno original_filen, sfileno new_filen);
 CossPendingReloc *storeCossGetPendingReloc(CossInfo * cs, sfileno new_filen);
 #if USE_AUFSOPS
 AIOCB storeCossCompletePendingReloc;
+AIOCB storeCossCompleteReadStripe;
 #else
 DRCB storeCossCompletePendingReloc;
+DRCB storeCossCompleteReadStripe;
 #endif
 
 /* Read operation code */
@@ -81,6 +85,7 @@ void storeCossKickReadOp(CossInfo * cs, CossReadOp * op);
 CBDATA_TYPE(storeIOState);
 CBDATA_TYPE(CossMemBuf);
 CBDATA_TYPE(CossPendingReloc);
+CBDATA_TYPE(CossPendingMigrate);
 
 /* === PUBLIC =========================================================== */
 
@@ -343,6 +348,7 @@ storeCossCreate(SwapDir * SD, StoreEntry * e, STFNCB * file_callback, STIOCB * c
     /* Now add it into the index list */
     e->swap_filen = sio->swap_filen;
     e->swap_dirn = sio->swap_dirn;
+    e->fsdata = BIGCOSS_CS;
     storeCossAdd(SD, e, cs->curstripe);
 
     storeCossMemBufLock(SD, sio);
@@ -361,6 +367,8 @@ storeCossOpen(SwapDir * SD, StoreEntry * e, STFNCB * file_callback,
     sfileno nf;
     BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
     CossInfo *cs = bcs->cs;
+    CossInfo *bs;
+    signed int swap_cossn = e->fsdata;
 
     assert(cs->rebuild.rebuilding == 0);
 
@@ -385,6 +393,44 @@ storeCossOpen(SwapDir * SD, StoreEntry * e, STFNCB * file_callback,
     cstate->flags.writing = 0;
     cstate->flags.reading = 0;
     cstate->reqdiskoffset = -1;
+
+    if (swap_cossn != BIGCOSS_CS) {
+	bs = bcs->bscs[swap_cossn];
+
+	nf = storeCossAllocate(SD, e, COSS_ALLOC_REALLOC);
+	if (nf == -1) {
+	    coss_stats.open.fail++;
+	    cbdataFree(sio);
+	    cs->numcollisions++;
+	    return NULL;
+	}
+
+	/* Remove the object from its currently-allocated backstore coss file */
+	storeCossRemove(SD, e);
+
+	storeCossNewPendingRelocate(cs, bs, sio, sio->swap_filen, nf);
+	sio->swap_filen = nf;
+	cstate->flags.reloc = 1;
+
+	/* Notify the upper levels that we've changed file number */
+	sio->file_callback(sio->callback_data, 0, sio);
+	e->fsdata = BIGCOSS_CS;
+
+	/*
+	 * lock the new buffer so it doesn't get swapped out on us
+	 * this will get unlocked in storeCossClose
+	 */
+	storeCossMemBufLock(SD, sio);
+
+	/*
+	 * Do the index magic to keep the disk and memory LRUs identical
+	 * by adding the object into the link list on the current stripe
+	 */
+	storeCossAdd(SD, e, cs->curstripe);
+
+	coss_stats.open.success++;
+	return sio;
+    }
 
     /* make local copy so we don't have to lock membuf */
     p = storeCossMemPointerFromDiskOffset(cs, storeCossFilenoToDiskOffset(f, cs), NULL);
@@ -433,7 +479,7 @@ storeCossOpen(SwapDir * SD, StoreEntry * e, STFNCB * file_callback,
 	if (nf < cs->max_disk_nf) {
 	    /* Remove the object from its currently-allocated stripe */
 	    storeCossRemove(SD, e);
-	    storeCossNewPendingRelocate(cs, sio, sio->swap_filen, nf);
+	    storeCossNewPendingRelocate(cs, cs, sio, sio->swap_filen, nf);
 	    sio->swap_filen = nf;
 	    cstate->flags.reloc = 1;
 	    /* Notify the upper levels that we've changed file number */
@@ -450,7 +496,7 @@ storeCossOpen(SwapDir * SD, StoreEntry * e, STFNCB * file_callback,
 	    storeCossAdd(SD, e, cs->curstripe);
 	} else {
 	    /* Relocate the object in COSS, but not in other layers */
-	    storeCossNewPendingRelocate(cs, sio, sio->swap_filen, nf);
+	    storeCossNewPendingRelocate(cs, cs, sio, sio->swap_filen, nf);
 	    sio->swap_filen = nf;
 	    cstate->flags.reloc = 1;
 
@@ -753,8 +799,34 @@ storeCossWriteMemBuf(SwapDir * SD, CossMemBuf * t)
 	debug(79, 3) ("aioWrite: FD %d: disk start: %" PRIu64 ", size %" PRIu64 "\n", cs->fd, (uint64_t) t->diskstart, (uint64_t) t->diskend - t->diskstart);
 	aioWrite(cs->fd, t->diskstart, &(t->buffer[0]), COSS_MEMBUF_SZ, storeCossWriteMemBufDone, t, NULL);
 #else
-	a_file_write(&cs->aq, cs->fd, t->diskstart, &t->buffer,
-	    COSS_MEMBUF_SZ, storeCossWriteMemBufDone, t, NULL);
+       if (bcs->numbscs == 0 || cs->stripes[t->stripe].frozenobjlist.head == NULL) {
+           a_file_write(&cs->aq, cs->fd, t->diskstart, &t->buffer,
+               COSS_MEMBUF_SZ, storeCossWriteMemBufDone, t, NULL);
+       } else {
+           CossInfo *bs = bcs->bscs[cs->stripes[t->stripe].bs_index];
+           CossMemBuf *tmp_membuf = cbdataAlloc(CossMemBuf);
+
+           CBDATA_INIT_TYPE(CossPendingMigrate);
+           CossPendingMigrate *pm = cbdataAlloc(CossPendingMigrate);
+
+           pm->sd = SD;
+           pm->tmp_membuf = tmp_membuf;
+           pm->full_membuf = t;
+           pm->to_index = cs->stripes[t->stripe].bs_index;
+           pm->to_stripe = cs->stripes[t->stripe].bs_stripe;
+           pm->from_stripe = t->stripe;
+           pm->frozenobjlist = cs->stripes[t->stripe].frozenobjlist;
+
+           debug(73, 3) ("storeCossWriteMemBuf: to_index: %d, to_stripe:%d, from_stripe:%d\n",
+               pm->to_index, pm->to_stripe, pm->from_stripe);
+
+           a_file_read(&cs->aq, cs->fd,
+               tmp_membuf->buffer,
+               COSS_MEMBUF_SZ,
+               t->diskstart,
+               storeCossCompleteReadStripe,
+               pm);
+       }
 #endif
     } else {
 	/* No need to write, just mark as written and free */
@@ -862,6 +934,55 @@ storeCossWriteMemBufDone(int fd, int r_errflag, size_t r_len, void *my_data)
     storeCossMaybeFreeBuf(cs, t);
 }
 
+#if USE_AUFSOPS
+static void
+storeCossMigrateStripeDone(int fd, void *my_data, const char *buf, int aio_return, int aio_errno)
+#else
+static void
+storeCossMigrateStripeDone(int fd, int r_errflag, size_t r_len, void *my_data)
+#endif
+{
+    SwapDir *sd;
+    BigCossInfo *bcs;
+    CossInfo *cs, *bs;
+    CossPendingMigrate *pm;
+    StoreEntry *e, *oe;
+    dlink_node *m, *n;
+    CossIndexNode *coss_node;
+
+    pm = (CossPendingMigrate *)my_data;
+    sd = pm->sd;
+    bcs = (BigCossInfo *) sd->fsdata;
+    cs = bcs->cs;
+    bs = bcs->bscs[pm->to_index];
+
+    m = pm->frozenobjlist.head;
+    while (m != NULL) {
+       n = m->next;
+       e = m->data;
+
+       oe = storeGet(e->hash.key);
+       if (oe == NULL) {
+           e->fsdata = pm->to_index;
+           e->swap_filen = storeCossDiskOffsetToFileno(
+                               storeCossFilenoToDiskOffset(e->swap_filen,cs)
+                                   - (off_t)pm->from_stripe * COSS_MEMBUF_SZ
+                                   + (off_t)pm->to_stripe * COSS_MEMBUF_SZ,
+                               bs);
+           storeHashInsert(e, e->hash.key);
+           debug(79, 3) ("storeCossMigrateStripeDone: add entry: e->fsdata:%d, e->swap_filen:%d\n",
+               e->fsdata, e->swap_filen);
+           coss_node = e->repl.data;
+           dlinkAddTail(e, &coss_node->node, &bs->stripes[pm->to_stripe].objlist);
+       }
+
+       m = n;
+    }
+
+    cbdataFree(pm->tmp_membuf);
+    cbdataFree(pm);
+}
+
 static CossMemBuf *
 storeCossCreateMemOnlyBuf(SwapDir * SD)
 {
@@ -920,6 +1041,7 @@ storeCossCreateMemBuf(SwapDir * SD, int stripe, sfileno curfn, int *collision)
     int numreleased = 0;
     BigCossInfo *bcs = (BigCossInfo *) SD->fsdata;
     CossInfo *cs = bcs->cs;
+    CossInfo *bs;
     off_t start = (off_t) stripe * COSS_MEMBUF_SZ;
     off_t o;
     static time_t last_warn = 0;
@@ -960,22 +1082,48 @@ storeCossCreateMemBuf(SwapDir * SD, int stripe, sfileno curfn, int *collision)
 	membuf_describe(t, 3, __LINE__);
     }
 
-    /*
-     * Kill objects from the tail to make space for a new chunk
-     */
     m = cs->stripes[stripe].objlist.head;
+    if (bcs->numbscs == 0 || m == NULL)
+        return newmb;
+
+    cs->stripes[stripe].bs_index = random() % bcs->numbscs;
+    cs->stripes[stripe].frozenobjlist = cs->stripes[stripe].objlist;
+    cs->stripes[stripe].objlist.head = NULL;
+    cs->stripes[stripe].objlist.tail = NULL;
+    bs = bcs->bscs[cs->stripes[stripe].bs_index];
+    cs->stripes[stripe].bs_stripe = bs->curstripe;
+    bs->curstripe = (bs->curstripe+1) % bs->numstripes;
+
+    /*
+     * Froze objects from the tail to make space for a new chunk and migrate the frozen objects to backstore coss later
+     */
     while (m != NULL) {
 	n = m->next;
 	e = m->data;
+	debug(79, 3) ("storeCossCreateMemBuf: froze entry: e->swap_dirn:%d, e->fsdata:%d, e->swap_filen:%d\n",
+	   e->swap_dirn, e->fsdata, e->swap_filen);
 	o = storeCossFilenoToDiskOffset(e->swap_filen, cs);
 	if (curfn > -1 && curfn == e->swap_filen)
-	    *collision = 1;	/* Mark an object alloc collision */
+	    *collision = 1;     /* Mark an object alloc collision */
 	assert((o >= newmb->diskstart) && (o < newmb->diskend));
-	debug(79, 3) ("COSS: %s: stripe %d, releasing filen %d (offset %" PRINTF_OFF_T ")\n", stripeCossPath(cs), stripe, e->swap_filen, (squid_off_t) o);
+	hash_remove_link(store_table, &e->hash);
+	m = n;
+    }
+
+    /*
+     * Kill objects from the backstore coss tail to make space for a new chunk
+     */
+    m = bs->stripes[cs->stripes[stripe].bs_stripe].objlist.head;
+    while (m != NULL) {
+	n = m->next;
+	e = m->data;
+	if (curfn > -1 && curfn == e->swap_filen)
+	    *collision = 1;     /* Mark an object alloc collision */
 	storeRelease(e);
 	numreleased++;
 	m = n;
     }
+
     if (numreleased > 0)
 	debug(79, 3) ("storeCossCreateMemBuf: this allocation released %d storeEntries\n", numreleased);
     coss_stats.stripes++;
@@ -1066,13 +1214,14 @@ storeCossFilenoToStripe(CossInfo * cs, sfileno filen)
  * New stuff
  */
 void
-storeCossNewPendingRelocate(CossInfo * cs, storeIOState * sio, sfileno original_filen, sfileno new_filen)
+storeCossNewPendingRelocate(CossInfo * to, CossInfo * from, storeIOState * sio, sfileno original_filen, sfileno new_filen)
 {
     CossPendingReloc *pr;
     CossMemBuf *membuf;
     char *p;
     off_t disk_offset;
     int stripe;
+    CossInfo *cs = to;
 
     pr = cbdataAlloc(CossPendingReloc);
     cbdataLock(pr);
@@ -1085,11 +1234,17 @@ storeCossNewPendingRelocate(CossInfo * cs, storeIOState * sio, sfileno original_
     dlinkAddTail(pr, &pr->node, &cs->pending_relocs);
 
     /* Update the stripe count */
-    stripe = storeCossFilenoToStripe(cs, original_filen);
+    stripe = storeCossFilenoToStripe(cs, new_filen);
     assert(stripe >= 0);
-    assert(stripe < cs->numstripes);
-    assert(cs->stripes[stripe].pending_relocs >= 0);
-    cs->stripes[stripe].pending_relocs++;
+    assert(stripe < cs->numstripes + cs->nummemstripes);
+    if (stripe < cs->numstripes) {
+        assert(cs->stripes[stripe].pending_relocs >= 0);
+        cs->stripes[stripe].pending_relocs++;
+    } else {
+        stripe -= cs->numstripes;
+        assert(cs->memstripes[stripe].pending_relocs >= 0);
+        cs->memstripes[stripe].pending_relocs++;
+    }
 
     /* And now; we begin the IO */
     p = storeCossMemPointerFromDiskOffset(cs, storeCossFilenoToDiskOffset(new_filen, cs), &membuf);
@@ -1098,14 +1253,14 @@ storeCossNewPendingRelocate(CossInfo * cs, storeIOState * sio, sfileno original_
     /* Lock the destination membuf */
     storeCossMemBufLockPending(pr, membuf);
 
-    disk_offset = storeCossFilenoToDiskOffset(original_filen, cs);
+    disk_offset = storeCossFilenoToDiskOffset(original_filen, from);
     debug(79, 3) ("COSS Pending Relocate: size %" PRINTF_OFF_T ", disk_offset %" PRIu64 "\n", (squid_off_t) sio->e->swap_file_sz, (int64_t) disk_offset);
 #if USE_AUFSOPS
     /* NOTE: the damned buffer isn't passed into aioRead! */
     debug(79, 3) ("COSS: aioRead: FD %d, from %d -> %d, offset %" PRIu64 ", len: %ld\n", cs->fd, pr->original_filen, pr->new_filen, (int64_t) disk_offset, (long int) pr->len);
-    aioRead(cs->fd, (off_t) disk_offset, pr->len, storeCossCompletePendingReloc, pr);
+    aioRead(from->fd, (off_t) disk_offset, pr->len, storeCossCompletePendingReloc, pr);
 #else
-    a_file_read(&cs->aq, cs->fd,
+    a_file_read(&cs->aq, from->fd,
 	p,
 	pr->len,
 	disk_offset,
@@ -1185,10 +1340,17 @@ storeCossCompletePendingReloc(int fd, const char *buf, int r_len, int r_errflag,
 
     /* Update the stripe count */
     stripe = storeCossFilenoToStripe(cs, pr->original_filen);
+    stripe = storeCossFilenoToStripe(cs, pr->new_filen);
     assert(stripe >= 0);
-    assert(stripe < cs->numstripes);
-    assert(cs->stripes[stripe].pending_relocs >= 1);
-    cs->stripes[stripe].pending_relocs--;
+    assert(stripe < cs->numstripes + cs->nummemstripes);
+    if (stripe < cs->numstripes) {
+	assert(cs->stripes[stripe].pending_relocs >= 1);
+	cs->stripes[stripe].pending_relocs--;
+    } else {
+	stripe -= cs->numstripes;
+	assert(cs->memstripes[stripe].pending_relocs >= 1);
+	cs->memstripes[stripe].pending_relocs--;
+    }
 
     /* Relocate has completed; we can now complete pending read ops on this particular entry */
     while (pr->ops.head != NULL) {
@@ -1207,6 +1369,36 @@ storeCossCompletePendingReloc(int fd, const char *buf, int r_len, int r_errflag,
     cbdataFree(pr);
     assert(cs->pending_reloc_count != 0);
     cs->pending_reloc_count--;
+}
+
+#if USE_AUFSOPS
+void
+storeCossCompleteReadStripe(int fd, void *my_data, const char *buf, int aio_return, int aio_errno)
+#else
+void
+storeCossCompleteReadStripe(int fd, const char *buf, int r_len, int r_errflag, void *my_data)
+#endif
+{
+    SwapDir *sd;
+    BigCossInfo *bcs;
+    CossInfo *cs;
+    CossInfo *bs;
+    CossPendingMigrate *pm;
+    CossMemBuf *t;
+
+    pm = (CossPendingMigrate *)my_data;
+    sd = pm->sd;
+    bcs = (BigCossInfo *) sd->fsdata;
+    cs = bcs->cs;
+    bs = bcs->bscs[pm->to_index];
+
+    t = pm->full_membuf;
+    a_file_write(&cs->aq, cs->fd, t->diskstart, &t->buffer,
+       COSS_MEMBUF_SZ, storeCossWriteMemBufDone, t, NULL);
+
+    t = pm->tmp_membuf;
+    a_file_write(&bs->aq, bs->fd, (off_t)pm->to_stripe*COSS_MEMBUF_SZ, &t->buffer,
+       COSS_MEMBUF_SZ, storeCossMigrateStripeDone, my_data, NULL);
 }
 
 /*

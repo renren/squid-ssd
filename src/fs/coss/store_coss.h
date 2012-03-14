@@ -14,6 +14,7 @@ typedef struct _cossinfo CossInfo;
 typedef struct _bigcossinfo BigCossInfo;
 typedef struct _cossstate CossState;
 typedef struct _cossindex CossIndexNode;
+typedef struct _coss_pending_migrate CossPendingMigrate;
 typedef struct _coss_pending_reloc CossPendingReloc;
 typedef struct _coss_read_op CossReadOp;
 typedef struct _cossstripe CossStripe;
@@ -110,6 +111,19 @@ struct _cossstripe {
     int pending_relocs;
     struct _cossmembuf *membuf;
     dlink_list objlist;
+    int bs_index;
+    int bs_stripe;
+    dlink_list frozenobjlist;
+};
+
+struct _coss_pending_migrate {
+    SwapDir *sd;
+    int to_index;
+    dlink_list frozenobjlist;
+    int from_stripe;
+    int to_stripe;
+    struct _cossmembuf *tmp_membuf;
+    struct _cossmembuf *full_membuf;
 };
 
 struct _coss_pending_reloc {

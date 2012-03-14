@@ -239,8 +239,8 @@ storeCossDirInit(SwapDir * sd)
 	    debug(79, 1) ("%s: %s\n", stripeCossPath(cs), xstrerror());
 	    fatal("storeCossDirInit: Failed to open a COSS file.");
 	}
-       storeCossDirRebuildCoss(cs);
-       bcs->rebuilding++;
+	storeCossDirRebuildCoss(cs);
+	bcs->rebuilding++;
     }
 
     n_coss_dirs++;
@@ -694,7 +694,7 @@ storeCossDirCheckObj(SwapDir * SD, const StoreEntry * e)
     /* Check if the object is a special object, we can't cache these */
     if (EBIT_TEST(e->flags, ENTRY_SPECIAL))
 	return 0;
-    if (cs->rebuild.rebuilding == 1)
+    if (bcs->rebuilding > 0)
 	return 0;
     /* Check to see if the object is going to waste too much disk space */
     if (objsize > cs->sizerange_max)
@@ -1002,6 +1002,8 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 	}
 
 	bs->fd = -1;
+	bs->swaplog_fd = -1;
+	bs->curstripe = 0;
 	bs->blksz_bits = cs->blksz_bits;
 	bs->blksz_mask = cs->blksz_mask;
     }
