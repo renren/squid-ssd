@@ -557,6 +557,34 @@ storeCossRead(SwapDir * SD, storeIOState * sio, char *buf, size_t size, squid_of
     storeCossKickReadOp(cs, op);
 }
 
+static squid_file_sz
+storeCossGetSwapFileSize(char *buf, size_t size)
+{
+    tlv *t, *tlv_list;
+    int bl = 0;
+    squid_off_t *l, len = 0;
+
+    tlv_list = storeSwapMetaUnpack(buf, &bl);
+    if (tlv_list == NULL)
+	return 0;
+
+    for (t = tlv_list; t; t = t->next)
+	if (t->type == STORE_META_OBJSIZE) {
+	    l = t->value;
+	    break;
+	}
+
+    if (l == NULL) {
+	storeSwapTLVFree(tlv_list);
+	return 0;
+    }
+    len = *l;
+
+    storeSwapTLVFree(tlv_list);
+
+    return len + bl;
+}
+
 void
 storeCossWrite(SwapDir * SD, storeIOState * sio, char *buf, size_t size, squid_off_t offset, FREE * free_func)
 {
@@ -573,6 +601,9 @@ storeCossWrite(SwapDir * SD, storeIOState * sio, char *buf, size_t size, squid_o
      */
     assert(sio->e->mem_obj->object_sz != -1);
     coss_stats.write.ops++;
+
+    if (sio->e->swap_file_sz == 0)
+	sio->e->swap_file_sz = storeCossGetSwapFileSize(buf, size);
 
     if (sio->offset != offset) {
 	debug(79, 1) ("storeCossWrite: Possible data corruption on fileno %d, offsets do not match (Current:%" PRINTF_OFF_T " Want:%" PRINTF_OFF_T ")\n", sio->swap_filen, sio->offset, offset);
@@ -901,11 +932,14 @@ static void
 storeCossWriteMemBufDone(int fd, int r_errflag, size_t r_len, void *my_data)
 #endif
 {
+    StoreEntry *e;
+    dlink_node *m, *n;
     CossMemBuf *t = my_data;
     BigCossInfo *bcs = (BigCossInfo *) t->SD->fsdata;
     CossInfo *cs = bcs->cs;
     int errflag;
     int len;
+    off_t old_begin, old_end;
 #if USE_AUFSOPS
     len = aio_return;
     if (aio_errno)
@@ -916,6 +950,27 @@ storeCossWriteMemBufDone(int fd, int r_errflag, size_t r_len, void *my_data)
     len = r_len;
     errflag = r_errflag;
 #endif
+
+    old_begin = cs->index_info->offsets[t->stripe].begin;
+    cs->index_info->offsets[t->stripe].begin = cs->index_info->file_offset;
+
+    m = cs->stripes[t->stripe].objlist.head;
+    while (m != NULL) {
+       n = m->next;
+
+       e = m->data;
+       storeCossDirWriteEntryIndex(t->SD, e, (char) SWAP_LOG_ADD);
+
+       m = n;
+    }
+
+    old_end = cs->index_info->offsets[t->stripe].end;
+    cs->index_info->offsets[t->stripe].end = cs->index_info->file_offset;
+
+    cs->index_info->header.stripe_begin = old_end;
+    cs->index_info->header.stripe_end = cs->index_info->offsets[t->stripe].end;
+    cs->index_info->header.curstripe = (t->stripe + 1) % cs->numstripes;
+    pwrite(cs->index_info->fd, &cs->index_info->header, sizeof(struct _cossindexheader), 0);
 
     debug(79, 3) ("storeCossWriteMemBufDone: stripe %d, buf %p, len %ld\n", t->stripe, t, (long int) len);
     if (errflag) {
@@ -949,12 +1004,16 @@ storeCossMigrateStripeDone(int fd, int r_errflag, size_t r_len, void *my_data)
     StoreEntry *e, *oe;
     dlink_node *m, *n;
     CossIndexNode *coss_node;
+    off_t old_begin, old_end;
 
     pm = (CossPendingMigrate *)my_data;
     sd = pm->sd;
     bcs = (BigCossInfo *) sd->fsdata;
     cs = bcs->cs;
     bs = bcs->bscs[pm->to_index];
+
+    old_begin = cs->index_info->offsets[pm->to_stripe].begin;
+    cs->index_info->offsets[pm->to_stripe].begin = cs->index_info->file_offset;
 
     m = pm->frozenobjlist.head;
     while (m != NULL) {
@@ -969,15 +1028,24 @@ storeCossMigrateStripeDone(int fd, int r_errflag, size_t r_len, void *my_data)
                                    - (off_t)pm->from_stripe * COSS_MEMBUF_SZ
                                    + (off_t)pm->to_stripe * COSS_MEMBUF_SZ,
                                bs);
-           storeHashInsert(e, e->hash.key);
-           debug(79, 3) ("storeCossMigrateStripeDone: add entry: e->fsdata:%d, e->swap_filen:%d\n",
-               e->fsdata, e->swap_filen);
-           coss_node = e->repl.data;
-           dlinkAddTail(e, &coss_node->node, &bs->stripes[pm->to_stripe].objlist);
+	    hash_join(store_table, &e->hash);
+	    debug(79, 3) ("storeCossMigrateStripeDone: add entry: e->fsdata:%d, e->swap_filen:%d\n",
+                e->fsdata, e->swap_filen);
+	    coss_node = e->repl.data;
+	    dlinkAddTail(e, &coss_node->node, &bs->stripes[pm->to_stripe].objlist);
        }
 
+       storeCossDirWriteEntryIndex(sd, e, (char) SWAP_LOG_ADD);
        m = n;
     }
+
+    old_end = bs->index_info->offsets[pm->to_stripe].end;
+    bs->index_info->offsets[pm->to_stripe].end = bs->index_info->file_offset;
+
+    bs->index_info->header.stripe_begin = old_end;
+    bs->index_info->header.stripe_end = bs->index_info->offsets[pm->to_stripe].end;
+    bs->index_info->header.curstripe = (pm->to_stripe + 1) % bs->numstripes;
+    pwrite(bs->index_info->fd, &bs->index_info->header, sizeof(struct _cossindexheader), 0);
 
     cbdataFree(pm->tmp_membuf);
     cbdataFree(pm);
@@ -1148,7 +1216,7 @@ storeCossStartMembuf(SwapDir * sd)
      * The rebuild logic doesn't 'know' to pad out the current
      * offset to make it a multiple of COSS_MEMBUF_SZ.
      */
-    newmb = storeCossCreateMemBuf(sd, 0, -1, NULL);
+    newmb = storeCossCreateMemBuf(sd, cs->index_info->header.curstripe, -1, NULL);
     assert(!cs->current_membuf);
     cs->current_membuf = newmb;
 

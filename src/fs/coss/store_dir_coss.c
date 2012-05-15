@@ -77,6 +77,7 @@ struct _RebuildState {
 
 static char *storeCossDirSwapLogFile(SwapDir *, const char *);
 static void storeCossDirRebuildCoss(CossInfo * cs);
+static void storeCossDirRebuildIndex(CossInfo * cs);
 static void storeCossDirCloseTmpSwapLog(SwapDir * sd);
 static FILE *storeCossDirOpenTmpSwapLog(SwapDir *, int *, int *);
 static STLOGOPEN storeCossDirOpenSwapLog;
@@ -223,23 +224,25 @@ storeCossDirInit(SwapDir * sd)
     for (i = 0; i < bcs->numbscs; i++)
 	a_file_setupqueue(&bcs->bscs[i]->aq);
 #endif
-    cs->fd = file_open(stripeCossPath(cs), O_RDWR | O_CREAT | O_BINARY);
-    if (cs->fd < 0) {
-	debug(79, 1) ("%s: %s\n", stripeCossPath(cs), xstrerror());
-	fatal("storeCossDirInit: Failed to open a COSS file.");
-    }
     storeCossDirOpenSwapLog(sd);
-    storeCossDirRebuildCoss(cs);
-    bcs->rebuilding++;
 
-    for (i = 0; i < bcs->numbscs; i++) {
+    for (i = BIGCOSS_CS; i < bcs->numbscs; i++) {
 	cs = bcs->bscs[i];
 	cs->fd = file_open(stripeCossPath(cs), O_RDWR | O_CREAT | O_BINARY);
 	if (cs->fd < 0) {
 	    debug(79, 1) ("%s: %s\n", stripeCossPath(cs), xstrerror());
 	    fatal("storeCossDirInit: Failed to open a COSS file.");
 	}
-	storeCossDirRebuildCoss(cs);
+
+	cs->index_info->fd = file_open(cs->index_info->path, O_RDWR | O_CREAT | O_BINARY);
+	if (cs->index_info->fd < 0) {
+	    debug(79, 1) ("%s: %s\n", cs->index_info->path, xstrerror());
+	    debug(79, 1) ("storeCossDirInit: Failed to open a COSS index file, fall back to storeCossDirRebuildCoss.");
+	    storeCossDirRebuildCoss(cs);
+	} else {
+	    storeCossDirRebuildIndex(cs);
+	}
+
 	bcs->rebuilding++;
     }
 
@@ -316,6 +319,58 @@ storeCossRebuildComplete(void *data)
     cs->rebuild.rebuilding = 0;
     debug(47, 1) ("  %d objects scanned, %d objects relocated, %d objects fresher, %d objects ignored\n",
 	rb->counts.scancount, rb->cosscounts.reloc, rb->cosscounts.fresher, rb->cosscounts.unknown);
+    cbdataFree(rb);
+}
+
+static void
+storeCossRebuildIndexComplete(void *data)
+{
+    int i, left;
+    RebuildState *rb = data;
+    CossInfo *cs = rb->cs;
+    SwapDir *SD = cs->sd;
+    BigCossInfo *bcs = SD->fsdata;
+
+    bcs->rebuilding--;
+
+    debug(47, 3) ("storeCossRebuildComplete: %s, bcs->rebuilding:%d \n", stripeCossPath(cs), bcs->rebuilding);
+
+    if (bcs->rebuilding == 0) {
+	store_dirs_rebuilding--;
+
+	storeCossStartMembuf(SD);
+	storeRebuildComplete(&rb->counts);
+    }
+
+    debug(47, 1) ("COSS: %s: Rebuild Completed\n", stripeCossPath(cs));
+    cs->rebuild.rebuilding = 0;
+    debug(47, 1) ("  %d objects scanned, %d objects relocated, %d objects fresher, %d objects ignored\n",
+	rb->counts.scancount, rb->cosscounts.reloc, rb->cosscounts.fresher, rb->cosscounts.unknown);
+
+    left = COSS_LOGBUF_SZ - cs->index_info->header.stripe_end % COSS_LOGBUF_SZ;
+    if (left < sizeof(storeSwapLogData)) {
+	cs->index_info->buf_size = COSS_LOGBUF_SZ;
+	cs->index_info->file_offset = cs->index_info->header.stripe_end + left;
+    } else {
+	cs->index_info->buf_size = left;
+	cs->index_info->file_offset = cs->index_info->header.stripe_end;
+    }
+
+    if (cs->index_info->file_offset >= cs->index_info->header.header_len + cs->index_info->header.body_len) {
+	cs->index_info->file_offset = cs->index_info->header.header_len;
+    }
+
+    cs->index_info->log_buf = xcalloc(1, COSS_LOGBUF_SZ);
+    cs->index_info->buf_offset = 0;
+
+    lseek(cs->index_info->fd, cs->index_info->file_offset, SEEK_SET);
+
+    for (i = 0; i < cs->numstripes; i++)
+	debug(47, 3) ("storeCossRebuildIndexComplete: swap_dir:%d, stripe:%d, off_begin:%ld, off_end:%ld\n",
+		SD->index, i, cs->index_info->offsets[i].begin, cs->index_info->offsets[i].end);
+
+    cs->curstripe = cs->index_info->header.curstripe;
+
     cbdataFree(rb);
 }
 
@@ -568,6 +623,50 @@ storeSwapLogDataFree(void *s)
     memFree(s, MEM_SWAP_LOG_DATA);
 }
 
+void
+storeCossDirWriteEntryIndex(SwapDir * sd, const StoreEntry * e, char op)
+{
+    signed int swap_cossn = e->fsdata;
+    BigCossInfo *bcs = (BigCossInfo *) sd->fsdata;
+    CossInfo *cs = bcs->bscs[swap_cossn];
+
+    storeSwapLogData s;
+    static size_t ss = sizeof(storeSwapLogData);
+
+    memset(&s, '\0', ss);
+    s.op = (char) op;
+    s.swap_filen = e->swap_filen;
+    s.timestamp = e->timestamp;
+    s.lastref = e->lastref;
+    s.expires = e->expires;
+    s.lastmod = e->lastmod;
+    s.swap_file_sz = e->swap_file_sz;
+    s.refcount = e->refcount;
+    s.flags = e->flags;
+    xmemcpy(&s.key, e->hash.key, SQUID_MD5_DIGEST_LENGTH);
+    xmemcpy(cs->index_info->log_buf+cs->index_info->buf_offset, &s, ss);
+    cs->index_info->buf_offset += ss;
+    cs->index_info->file_offset += ss;
+
+    /* buffered write */
+    if (cs->index_info->buf_offset + ss > cs->index_info->buf_size) {
+	FD_WRITE_METHOD(cs->index_info->fd, cs->index_info->log_buf,
+		cs->index_info->buf_size);
+
+	cs->index_info->file_offset += cs->index_info->buf_size - cs->index_info->buf_offset;
+
+	cs->index_info->buf_offset = 0;
+	cs->index_info->buf_size = COSS_LOGBUF_SZ;
+
+	if (cs->index_info->file_offset >= cs->index_info->header.header_len + cs->index_info->header.body_len) {
+	    cs->index_info->file_offset = cs->index_info->header.header_len;
+	    lseek(cs->index_info->fd, cs->index_info->file_offset, SEEK_SET);
+	}
+    }
+
+    debug(47, 3) ("storeCossDirWriteEntryIndex: %s file_offset: %ld\n", stripeCossPath(cs), cs->index_info->file_offset);
+}
+
 static void
 storeCossDirSwapLog(const SwapDir * sd, const StoreEntry * e, int op)
 {
@@ -599,7 +698,11 @@ storeCossCreateStripe(CossInfo * cs)
     char *block;
     char const *path;
     int swap;
+    int index;
     int i;
+    CossIndexHeader header;
+    int indexsize;
+    int avg_objsize;
 
     path = stripeCossPath(cs);
     debug(47, 1) ("Creating COSS stripe %s\n", path);
@@ -611,6 +714,34 @@ storeCossCreateStripe(CossInfo * cs)
 	}
     }
     close(swap);
+
+    avg_objsize = 23000;
+    indexsize = sizeof(storeSwapLogData);    // 72 Bytes on x86_64
+    path = cs->index_info->path;
+    debug(47, 1) ("Creating COSS stripe index %s\n", path);
+    index = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
+    strcpy(header.magic, "COSSIDX");
+    header.version = 1;
+    header.header_len = COSS_MEMBUF_SZ;
+    header.stripe_begin = COSS_MEMBUF_SZ;
+    header.stripe_end = COSS_MEMBUF_SZ;
+    header.numstripes = cs->numstripes;
+    header.curstripe = 0;
+
+    /* header.body_len = cs->numstripes * COSS_MEMBUF_SZ / avg_objsize * avg_idxsize / COSS_MEMBUF_SZ * 2 + 1; */
+    header.body_len = 2 * indexsize * cs->numstripes / avg_objsize + 1;
+    header.body_len *= COSS_MEMBUF_SZ;
+
+    if (write(index, &header, sizeof(CossIndexHeader)) < sizeof(CossIndexHeader))
+	fatalf("Failed to create COSS stripe index %s\n", path);
+    lseek(index, header.header_len, SEEK_SET);
+    for (i = 0; i < header.body_len/COSS_MEMBUF_SZ; ++i) {
+	if (write(index, block, COSS_MEMBUF_SZ) < COSS_MEMBUF_SZ) {
+	    fatalf("Failed to create COSS stripe index %s\n", path);
+       }
+    }
+    close(index);
+
     xfree(block);
 }
 
@@ -646,6 +777,7 @@ storeCossDirFree(SwapDir * SD)
 	cs->swaplog_fd = -1;
     }
     xfree(cs->stripes);
+    xfree(cs->index_info);
     xfree(cs->memstripes);
     storeCossDirFreeBigCoss(bcs);
     SD->fsdata = NULL;		/* Will aid debugging... */
@@ -668,7 +800,9 @@ storeCossDirShutdown(SwapDir * SD)
 #endif
     file_close(cs->fd);
     cs->fd = -1;
+    cs->index_info->fd = -1;
     xfree((void *) cs->stripe_path);
+    xfree((void *) cs->index_info->path);
 
     if (cs->swaplog_fd > -1) {
 	file_close(cs->swaplog_fd);
@@ -865,6 +999,10 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
     bcs = storeCossDirAllocBigCoss();
     cs = bcs->cs;
 
+    cs->index_info = xcalloc(1, sizeof(CossIndexInfo));
+    if (cs->index_info == NULL)
+	fatal("storeCossDirParse: couldn't xmalloc() CossIndexInfo!\n");
+
     sd->index = index;
     sd->path = xstrdup(path);
     sd->max_size = size;
@@ -876,6 +1014,9 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 	    strcat(pathtmp, "/stripe");
 
     cs->stripe_path = xstrdup(pathtmp);
+    strcat(pathtmp, ".idx");
+    cs->index_info->path = xstrdup(pathtmp);
+
     cs->max_size = size;
     cs->sd = sd;
 
@@ -914,6 +1055,7 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 
     cs->current_offset = 0;
     cs->fd = -1;
+    cs->index_info->fd = -1;
     cs->swaplog_fd = -1;
     cs->numcollisions = 0;
     cs->membufs.head = cs->membufs.tail = NULL;		/* set when the rebuild completes */
@@ -989,6 +1131,8 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 	cs->memstripes[i].numdiskobjs = -1;
     }
 
+    cs->index_info->offsets = xcalloc(cs->numstripes, sizeof(struct _stripeindexoffset));
+
     for (i = 0; i < bcs->numbscs; i++) {
 	bs = bcs->bscs[i];
 
@@ -1001,7 +1145,9 @@ storeCossDirParse(SwapDir * sd, int index, char *path)
 	    bs->stripes[j].numdiskobjs = -1;
 	}
 
+	bs->index_info->offsets = xcalloc(bs->numstripes, sizeof(struct _stripeindexoffset));
 	bs->fd = -1;
+	bs->index_info->fd = -1;
 	bs->swaplog_fd = -1;
 	bs->curstripe = 0;
 	bs->blksz_bits = cs->blksz_bits;
@@ -1149,6 +1295,10 @@ storeCossDirParseBackstore(SwapDir * sd, const char *name, const char *value, in
 
     bs = bcs->bscs[bcs->numbscs++];
 
+    bs->index_info = xcalloc(1, sizeof(CossIndexInfo));
+    if (bs->index_info == NULL)
+	fatal("storeCossDirParseBackStore: couldn't xmalloc() CossIndexInfo!\n");
+
     strcpy(pathtmp, value);
     cursor = strchr(pathtmp, ',');
     if (cursor == NULL)
@@ -1164,6 +1314,8 @@ storeCossDirParseBackstore(SwapDir * sd, const char *name, const char *value, in
 	if (S_ISDIR(st.st_mode))
 	    strcat(pathtmp, "/stripe");
     bs->stripe_path = xstrdup(pathtmp);
+    strcat(pathtmp, ".idx");
+    bs->index_info->path = xstrdup(pathtmp);
 
     sd->max_size += bs->max_size;
 }
@@ -1573,6 +1725,166 @@ storeDirCoss_ParseStripeBuffer(RebuildState * rb)
     }
 }
 
+#if USE_AUFSOPS
+static void
+storeDirCoss_ReadStripeIndexComplete(int fd, void *my_data, const char *buf, int aio_return, int aio_errno)
+#else
+static void
+storeDirCoss_ReadStripeIndexComplete(int fd, off_t read_offset, const char *buf, int r_len, int r_errflag, void *my_data)
+#endif
+{
+    RebuildState *rb = my_data;
+    CossInfo *cs = rb->cs;
+    SwapDir *SD = cs->sd;
+    BigCossInfo *bcs = SD->fsdata;
+
+    off_t entry_begin, entry_end;
+
+    int j = 0;
+    StoreEntry tmpe;
+    storeSwapLogData *s;
+    size_t ss = sizeof(storeSwapLogData);
+
+    while (j + ss < r_len) {
+	entry_begin = read_offset + j;
+	entry_end = entry_begin + ss;
+
+	s = (storeSwapLogData *)(buf + j);
+	j += ss;
+
+	if (s->op == SWAP_LOG_NOP || s->swap_file_sz < 0 || s->swap_filen < 0)
+	    continue;
+
+	memset(&tmpe, 0, sizeof(tmpe));
+	xmemcpy(&tmpe.timestamp, &s->timestamp, STORE_HDR_METASIZE);
+	tmpe.hash.key = s->key;
+	tmpe.swap_file_sz = s->swap_file_sz;
+	tmpe.swap_filen = s->swap_filen;
+	tmpe.swap_dirn = SD->index;
+
+	cs->rebuild.curstripe = storeCossFilenoToStripe(cs, tmpe.swap_filen);
+	storeCoss_ConsiderStoreEntry(rb, s->key, &tmpe);
+
+        if (cs->index_info->offsets[cs->rebuild.curstripe].begin == 0) {
+            cs->index_info->offsets[cs->rebuild.curstripe].begin = entry_begin;
+        }
+
+        cs->index_info->offsets[cs->rebuild.curstripe].end = entry_end;
+    }
+}
+
+static void
+storeCossDirRebuildIndex(CossInfo *cs)
+{
+    RebuildState *rb;
+    int clean = 0;
+    int zero = 0;
+    off_t read_offset = 0;
+
+    CBDATA_INIT_TYPE(RebuildState);
+    rb = cbdataAlloc(RebuildState);
+    rb->cs = cs;
+    rb->flags.clean = (unsigned int) clean;
+    debug(20, 1) ("Rebuilding COSS storage index in %s (DIRTY)\n", cs->index_info->path);
+
+    assert(cs->rebuild.rebuilding == 0);
+    assert(cs->numstripes > 0);
+    assert(cs->rebuild.buf == NULL);
+    assert(cs->fd >= 0);
+
+    cs->rebuild.rebuilding = 1;
+    cs->rebuild.curstripe = 0;
+    cs->rebuild.buf = NULL;
+    rb->report_interval = cs->numstripes / COSS_REPORT_INTERVAL;
+    rb->report_current = 0;
+    debug(47, 2) ("COSS: %s: Beginning disk index rebuild.\n", cs->index_info->path);
+
+    read(cs->index_info->fd, &cs->index_info->header, sizeof(CossIndexHeader));
+    if (strcmp(cs->index_info->header.magic, "COSSIDX")) {
+        fatal("storeCossDirRebuildIndex: COSS index file corrupted.");
+    }
+
+    lseek(cs->index_info->fd, cs->index_info->header.stripe_begin, SEEK_SET);
+
+    int i;
+    int req_len = 0;
+    char *buf = xcalloc(COSS_LOGBUF_SZ, 1);
+    read_offset = cs->index_info->header.stripe_begin;
+
+    /* Ugly code */
+    if (cs->index_info->header.stripe_begin == cs->index_info->header.stripe_end) {
+	// Pass
+    } else if (cs->index_info->header.stripe_begin < cs->index_info->header.stripe_end) {
+	// Read (stripe_begin, stripe_end]
+
+	// 1. ( stripe_begin, COSS_MEMBUF_SZ*(stripe_begin/COSS_MEMBUF_SZ+1) ]
+	req_len = (off_t)COSS_LOGBUF_SZ * (cs->index_info->header.stripe_begin / COSS_LOGBUF_SZ + 1) - cs->index_info->header.stripe_begin;
+	FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	read_offset += req_len;
+
+	// 2. ( COSS_MEMBUF_SZ*(stripe_begin/COSS_MEMBUF_SZ+1), stripe_end/COSS_MEMBUF_SZ*COSS_MEMBUF_SZ ]
+	for (i = cs->index_info->header.stripe_begin / COSS_LOGBUF_SZ + 1;
+	     i < cs->index_info->header.stripe_end / COSS_LOGBUF_SZ;
+	     i++) {
+	    req_len = COSS_LOGBUF_SZ;
+	    FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	    debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	    storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	    read_offset += req_len;
+	}
+
+	// 3. ( stripe_end/COSS_MEMBUF_SZ*COSS_MEMBUF_SZ, stripe_end ]
+	req_len = cs->index_info->header.stripe_end - (off_t)i * COSS_LOGBUF_SZ;
+	FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	read_offset += req_len;
+    } else {
+        // Read (stripe_begin, stripe_file_end] and (header_len, stripe_end)
+
+	// 1. ( stripe_begin, COSS_MEMBUF_SZ*(stripe_begin/COSS_MEMBUF_SZ+1) ]
+	req_len = (off_t)COSS_LOGBUF_SZ * (cs->index_info->header.stripe_begin / COSS_LOGBUF_SZ + 1) - cs->index_info->header.stripe_begin;
+	FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	read_offset += req_len;
+
+	// 2. ( COSS_MEMBUF_SZ*(stripe_begin/COSS_MEMBUF_SZ+1), filelen ]
+	for (i = cs->index_info->header.stripe_begin / COSS_LOGBUF_SZ + 1;
+	     i < (cs->index_info->header.body_len + cs->index_info->header.header_len) / COSS_LOGBUF_SZ;
+	     i++) {
+	    req_len = COSS_LOGBUF_SZ;
+	    FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	    debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	    storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	    read_offset += req_len;
+	}
+
+	// 3. ( header_len, stripe_end/COSS_MEMBUF_SZ*COSS_MEMBUF_SZ ]
+	lseek(cs->index_info->fd, cs->index_info->header.header_len, SEEK_SET);
+	read_offset = cs->index_info->header.header_len;
+        for (i = cs->index_info->header.header_len / COSS_LOGBUF_SZ; i < cs->index_info->header.stripe_end / COSS_LOGBUF_SZ; i++) {
+	    req_len = COSS_LOGBUF_SZ;
+	    FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	    debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	    storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	    read_offset += req_len;
+        }
+
+        // 4. ( stripe_end/COSS_MEMBUF_SZ*COSS_MEMBUF_SZ, stripe_end ]
+	req_len = cs->index_info->header.stripe_end - (off_t)i * COSS_LOGBUF_SZ;
+	FD_READ_METHOD(cs->index_info->fd, buf, req_len);
+	debug(47, 3) ("storeCossDirRebuildIndex: %s, req_len: %d\n", cs->index_info->path, req_len);
+	storeDirCoss_ReadStripeIndexComplete(cs->index_info->fd, read_offset, buf, req_len, 0, rb);
+	read_offset += req_len;
+    }
+
+    xfree(buf);
+
+    storeCossRebuildIndexComplete(rb);
+}
 
 static void
 storeCoss_AddStoreEntry(RebuildState * rb, const cache_key * key, StoreEntry * e)

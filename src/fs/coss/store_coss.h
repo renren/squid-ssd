@@ -6,12 +6,16 @@
 #endif
 
 #define	COSS_REPORT_INTERVAL		20
+#define	COSS_LOGBUF_SZ	                1048576
 
 /* Note that swap_filen in sio/e are actually disk block offsets too! */
 
 typedef struct _cossmembuf CossMemBuf;
 typedef struct _cossinfo CossInfo;
 typedef struct _bigcossinfo BigCossInfo;
+typedef struct _cossindexheader CossIndexHeader;
+typedef struct _stripeindexoffset StripeIndexOffset;
+typedef struct _cossindexinfo CossIndexInfo;
 typedef struct _cossstate CossState;
 typedef struct _cossindex CossIndexNode;
 typedef struct _coss_pending_migrate CossPendingMigrate;
@@ -136,6 +140,33 @@ struct _coss_pending_reloc {
     struct _cossmembuf *locked_membuf;
 };
 
+struct _cossindexheader {
+    char magic[8];
+    int  version;
+    int  header_len;
+    off_t  body_len;
+    off_t  stripe_begin;
+    off_t  stripe_end;
+    int  numstripes;
+    int  curstripe;
+};
+
+struct _stripeindexoffset {
+    off_t  begin;
+    off_t  end;
+};
+
+struct _cossindexinfo {
+    int fd;
+    const char *path;
+    struct _cossindexheader header;
+    struct _stripeindexoffset *offsets;
+    int buf_size;
+    int buf_offset;
+    unsigned char *log_buf;
+    off_t  file_offset;
+};
+
 
 /* Per-storedir info */
 struct _cossinfo {
@@ -186,6 +217,7 @@ struct _cossinfo {
     const char *stripe_path;
     int max_size;
     SwapDir *sd;
+    struct _cossindexinfo *index_info;
 };
 
 #define BIGCOSS_CS        -1
